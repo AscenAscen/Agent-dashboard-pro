@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 import feedparser
@@ -18,6 +19,14 @@ st.set_page_config(
 KST = timezone(timedelta(hours=9))
 MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
+PERIOD_OPTIONS = {
+    "최근 1일": 1,
+    "최근 7일": 7,
+    "최근 30일": 30,
+    "최근 90일": 90,
+    "전체 기간": None,
+}
+
 
 def get_gemini_key() -> str:
     try:
@@ -33,29 +42,49 @@ def clean_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
-def fetch_google_news(region: str, queries: list[str], limit_per_query: int = 4) -> list[dict]:
+def fetch_google_news(query: str, days: int | None = 30, limit: int = 10) -> list[dict]:
+    q = query.strip()
+    if not q:
+        return []
+
+    search_q = f"{q} when:{days}d" if days else q
+    url = f"https://news.google.com/rss/search?q={quote(search_q)}&hl=ko&gl=KR&ceid=KR:ko"
+    feed = feedparser.parse(url)
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(days=days) if days else None
+
     seen_titles = set()
     articles = []
-    region_prefix = region.strip().split()[0] if region.strip() else ""
-
-    for q in queries:
-        q = q.strip()
-        if not q:
+    for entry in feed.entries:
+        title = clean_html(entry.get("title", ""))
+        if not title or title in seen_titles:
             continue
-        search_q = q if (not region_prefix or region_prefix in q) else f"{region.strip()} {q}"
-        url = f"https://news.google.com/rss/search?q={quote(search_q)}&hl=ko&gl=KR&ceid=KR:ko"
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:limit_per_query]:
-            title = clean_html(entry.get("title", ""))
-            if not title or title in seen_titles:
-                continue
-            seen_titles.add(title)
-            articles.append({
-                "title": title,
-                "summary": clean_html(entry.get("summary", ""))[:180],
-                "link": entry.get("link", ""),
-            })
-    return articles[:6]
+
+        pub_str = entry.get("published", "")
+        pub_display = ""
+        if pub_str:
+            try:
+                pub_dt = parsedate_to_datetime(pub_str)
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                if cutoff and pub_dt < cutoff:
+                    continue
+                pub_display = pub_dt.astimezone(KST).strftime("%Y-%m-%d")
+            except Exception:
+                pub_display = pub_str[:16]
+
+        seen_titles.add(title)
+        articles.append({
+            "title": title,
+            "published_at": pub_display,
+            "summary": clean_html(entry.get("summary", ""))[:180],
+            "link": entry.get("link", ""),
+        })
+        if len(articles) >= limit:
+            break
+
+    return articles
 
 
 def extract_json_block(text: str):
@@ -99,27 +128,27 @@ def call_gemini_text(api_key: str, prompt: str, temperature: float = 0.2) -> str
     raise RuntimeError(last_err or "Gemini 호출 실패")
 
 
-def summarize_news_with_gemini(api_key: str, region: str, complexes: str, raw_articles: list[dict]) -> list[dict]:
+def summarize_news_with_gemini(api_key: str, query: str, raw_articles: list[dict]) -> list[dict]:
     prompt = f"""
-대한민국 부동산 입지·시세 분석가로서 [{region}] 뉴스 중 투자 가치가 있는 기사만 골라 순수 JSON으로만 답하세요.
-관심 단지: {complexes}
+대한민국 부동산 입지·시세 분석가로서 '{query}' 검색 결과 중 투자·임장 가치가 있는 기사만 골라 순수 JSON으로만 답하세요.
 
 출력 형식:
 {{
   "articles": [
     {{
       "title": "기사 제목",
+      "published_at": "발행일 (YYYY-MM-DD)",
       "link": "원문 URL",
       "category": "정비사업 | 교통호재 | 공급·분양 | 규제·정책 | 학군·환경",
       "sentiment": "호재 | 중립 | 악재",
       "summary_3lines": ["핵심 1줄", "핵심 2줄", "핵심 3줄"],
-      "impact_analysis": "관심 단지·시세에 미치는 영향 (1~2문장)",
-      "imjang_checkpoint": "전임·임장 시 사장님께 확인할 질문 1가지"
+      "impact_analysis": "해당 지역·단지 시세에 미치는 영향 (1~2문장)",
+      "imjang_checkpoint": "전임·임장 시 부동산 사장님께 확인할 질문 1가지"
     }}
   ]
 }}
 
-규칙: 광고·분양홍보·타지역 기사 제외. 코드블록 없이 순수 JSON만 출력.
+규칙: 단순 광고·분양홍보 기사 제외. 코드블록 없이 순수 JSON만 출력.
 
 [뉴스 목록]
 {json.dumps(raw_articles, ensure_ascii=False)}
@@ -170,7 +199,7 @@ if "phone_logs" not in st.session_state:
     st.session_state["phone_logs"] = []
 
 st.title("🏢 AI 임장 에이전트 대시보드")
-st.caption("지역 뉴스 3줄 요약 · 전임/매임 통화 정리 · 임장보고서 초안 생성")
+st.caption("지역·단지 뉴스 3줄 요약 · 전임/매임 통화 정리")
 
 api_key = get_gemini_key()
 
@@ -186,32 +215,36 @@ with st.sidebar:
     st.write(f"📰 조회된 뉴스: **{len(st.session_state['news_results'])}건**")
     st.write(f"📞 정리된 전임 메모: **{len(st.session_state['phone_logs'])}건**")
 
-tab1, tab2, tab3 = st.tabs(["📰 뉴스 검색·요약", "📞 전임·매임 통화 정리", "📑 임장보고서 초안"])
+tab1, tab2 = st.tabs(["📰 뉴스 검색·요약", "📞 전임·매임 통화 정리"])
 
 with tab1:
-    st.subheader("최신 지역 뉴스 수집 및 AI 요약")
-    col1, col2 = st.columns([1, 2])
-    region_input = col1.text_input("임장 지역", value="안양 평촌")
-    complexes_input = col2.text_input("주요 관심 단지 (쉼표 구분)", value="관악성원, 꿈마을, 귀인마을, 목련마을")
-    queries_input = st.text_input(
-        "검색 키워드 (쉼표 구분)",
-        value="선도지구, 재건축, 인덕원 동탄선",
+    st.subheader("뉴스 검색 및 AI 핵심 요약")
+    col1, col2 = st.columns([3, 1])
+    search_query = col1.text_input(
+        "검색어",
+        value="평촌 선도지구 재건축",
+        placeholder="예: 평촌 관악성원, 울산 중구 트램, 인덕원 동탄선...",
+    )
+    selected_period = col2.selectbox(
+        "검색 기간",
+        options=list(PERIOD_OPTIONS.keys()),
+        index=2,
     )
 
-    if st.button("🔍 최신 뉴스 가져와서 요약하기", type="primary"):
+    if st.button("🔍 뉴스 검색해서 요약하기", type="primary"):
         if not api_key:
             st.error("Gemini API 키를 설정해 주세요.")
+        elif not search_query.strip():
+            st.warning("검색어를 입력해 주세요.")
         else:
-            queries = [q.strip() for q in queries_input.split(",") if q.strip()]
-            with st.spinner("핵심 뉴스를 검색하고 요약 중입니다..."):
+            days = PERIOD_OPTIONS[selected_period]
+            with st.spinner(f"'{search_query}' ({selected_period}) 뉴스를 검색하고 요약 중입니다..."):
                 try:
-                    raw_news = fetch_google_news(region_input, queries, limit_per_query=4)
+                    raw_news = fetch_google_news(search_query, days=days, limit=10)
                     if not raw_news:
-                        st.warning("검색된 뉴스가 없습니다. 키워드를 바꿔 보세요.")
+                        st.warning(f"{selected_period} 내에 검색된 뉴스가 없습니다. 검색 기간을 넓히거나 검색어를 바꿔 보세요.")
                     else:
-                        summarized = summarize_news_with_gemini(api_key, region_input, complexes_input, raw_news)
-                        for item in summarized:
-                            item["region"] = region_input.strip()
+                        summarized = summarize_news_with_gemini(api_key, search_query, raw_news)
                         st.session_state["news_results"] = summarized
                         st.success(f"총 {len(summarized)}건의 핵심 부동산 뉴스를 정리했습니다!")
                 except Exception as e:
@@ -221,94 +254,9 @@ with tab1:
     for art in st.session_state["news_results"]:
         sentiment = art.get("sentiment", "중립")
         badge = "🟢 호재" if sentiment == "호재" else ("🔴 악재" if sentiment == "악재" else "⚪ 중립")
-        with st.expander(f"{badge} [{art.get('category', '이슈')}] {art.get('title', '')}", expanded=True):
+        pub_date = f" ({art['published_at']})" if art.get("published_at") else ""
+        with st.expander(f"{badge} [{art.get('category', '이슈')}] {art.get('title', '')}{pub_date}", expanded=True):
             for line in art.get("summary_3lines", []):
                 st.markdown(f"- {line}")
             st.info(f"**입지·시세 영향:** {art.get('impact_analysis', '')}")
             st.warning(f"**전임·임장 확인 질문:** {art.get('imjang_checkpoint', '')}")
-            if art.get("link"):
-                st.markdown(f"[원문 기사 보기]({art['link']})")
-
-with tab2:
-    st.subheader("전화임장 / 현장임장 메모 AI 정리")
-    with st.form("phone_form"):
-        c1, c2, c3 = st.columns(3)
-        p_region = c1.text_input("지역", value=region_input)
-        p_complex = c2.text_input("단지명", placeholder="예: 관악성원")
-        p_agency = c3.text_input("부동산명", placeholder="예: OO공인중개사")
-        p_note = st.text_area(
-            "통화 메모 또는 녹취 내용 붙여넣기",
-            height=150,
-            placeholder="예: 33평 102동 중층 남향 8억5천 급매 1개 있음. 올수리, 주인거주 입주협의 가능. 전세는 5억2천선...",
-        )
-        run_phone = st.form_submit_button("✨ AI로 매물표·후속질문 정리하기", type="primary")
-
-    if run_phone:
-        if not api_key:
-            st.error("GEMINI_API_KEY를 입력해 주세요.")
-        elif not p_note.strip():
-            st.warning("통화 메모를 입력해 주세요.")
-        else:
-            with st.spinner("통화 내용을 매물표와 후속 질문으로 정리 중입니다..."):
-                try:
-                    result = analyze_phone_note_with_gemini(api_key, p_region, p_complex, p_agency, p_note)
-                    st.session_state["phone_logs"].insert(0, {
-                        "time": datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
-                        "region": p_region.strip(),
-                        "complex": p_complex.strip(),
-                        "agency": p_agency.strip(),
-                        "raw": p_note.strip(),
-                        "result": result,
-                    })
-                    st.success("정리 완료!")
-                except Exception as e:
-                    st.error(f"정리 실패: {e}")
-
-    st.divider()
-    for log in st.session_state["phone_logs"]:
-        st.markdown(f"#### {log['time']} | [{log['region']}] {log['complex']} ({log['agency']})")
-        res = log["result"]
-        if res.get("listings"):
-            st.table(res["listings"])
-        if res.get("market_mood"):
-            st.info(f"**단지 분위기:** {res['market_mood']}")
-        if res.get("next_questions"):
-            st.warning("**다음 확인 질문:** " + " / ".join(res["next_questions"]))
-        with st.expander("원문 메모 보기"):
-            st.text(log["raw"])
-
-with tab3:
-    st.subheader("임장보고서 핵심 초안 생성")
-    if st.button("📑 현재 뉴스 + 전임 내용으로 보고서 초안 만들기", type="primary"):
-        if not api_key:
-            st.error("GEMINI_API_KEY를 입력해 주세요.")
-        elif not st.session_state["news_results"] and not st.session_state["phone_logs"]:
-            st.warning("먼저 1번 탭에서 뉴스를 요약하거나 2번 탭에서 전임 메모를 정리해 주세요.")
-        else:
-            with st.spinner("임장보고서 초안을 작성 중입니다..."):
-                prompt = f"""
-부동산 임장보고서 작성 코치로서 [{region_input}]의 요약 뉴스와 전임/매임 기록을 종합해 깔끔한 마크다운 임장보고서 초안을 작성하세요.
-
-[요약 뉴스]
-{json.dumps(st.session_state['news_results'], ensure_ascii=False)}
-
-[전임/매임 기록]
-{json.dumps(st.session_state['phone_logs'], ensure_ascii=False)}
-
-목차:
-1. 지역 핵심 이슈 및 호재·악재 요약
-2. 단지별 매물·시세·현장 분위기 (전임 기반)
-3. 관심 단지 체크포인트 및 우선순위
-4. 다음 현장 임장(매임) 실행 계획
-"""
-                try:
-                    report = call_gemini_text(api_key, prompt, temperature=0.3)
-                    st.markdown(report)
-                    st.download_button(
-                        "마크다운(.md) 파일로 저장",
-                        data=report.encode("utf-8"),
-                        file_name=f"{region_input}_임장보고서_초안.md",
-                        mime="text/markdown",
-                    )
-                except Exception as e:
-                    st.error(f"보고서 생성 오류: {e}")
