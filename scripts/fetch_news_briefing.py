@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import html
 import hashlib
@@ -10,7 +11,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 TARGET_REGIONS = {
     "안양 평촌": {
@@ -31,13 +32,13 @@ class AnalyzedArticle(BaseModel):
     title: str = Field(description="정제된 기사 제목")
     link: str = Field(description="원문 기사 URL")
     pub_date: str = Field(description="발행일 (YYYY-MM-DD)")
-    is_relevant: bool = Field(description="실제 부동산 가치, 정비사업, 교통, 학군, 공급에 영향을 주는 유의미한 뉴스인지 여부 (단순 광고/분양홍보/타지역 기사는 false)")
+    is_relevant: bool = Field(description="실제 부동산 가치, 정비사업, 교통, 학군, 공급에 영향을 주는 유의미한 뉴스인지 여부")
     category: str = Field(description="정비사업 | 교통호재 | 공급·분양 | 규제·정책 | 학군·환경 중 택1")
     sentiment: str = Field(description="호재 | 중립 | 악재 중 택1")
-    summary_3lines: list[str] = Field(description="핵심 내용 3줄 요약 (각 줄은 명확한 한 문장)")
+    summary_3lines: list[str] = Field(description="핵심 내용 3줄 요약")
     impacted_complexes: list[str] = Field(description="직간접적 영향이 예상되는 단지명 또는 생활권")
     impact_analysis: str = Field(description="해당 지역 및 단지 시세·전세·수요에 미치는 구체적 영향 (2문장 이내)")
-    imjang_checkpoint: str = Field(description="전임(전화임장) 또는 현장 임장 시 부동산 사장님께 확인해볼 질문 1가지")
+    imjang_checkpoint: str = Field(description="전임 또는 현장 임장 시 부동산 사장님께 확인해볼 질문 1가지")
 
 
 class RegionBriefingResult(BaseModel):
@@ -65,6 +66,28 @@ def fetch_google_news_rss(query: str, limit: int = 8) -> list[dict]:
     return cleaned
 
 
+def call_gemini_json(client: genai.Client, prompt: str) -> str:
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+    last_err = None
+    for model_name in models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=RegionBriefingResult,
+                    temperature=0.2,
+                ),
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            print(f"[{model_name}] 호출 오류: {e}", file=sys.stderr)
+            last_err = e
+    raise RuntimeError(f"Gemini API 호출 실패: {last_err}")
+
+
 def analyze_with_gemini(region: str, key_complexes: list[str], raw_articles: list[dict]) -> list[dict]:
     if not raw_articles:
         return []
@@ -84,17 +107,8 @@ def analyze_with_gemini(region: str, key_complexes: list[str], raw_articles: lis
 {json.dumps(raw_articles, ensure_ascii=False, indent=2)}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=RegionBriefingResult,
-            temperature=0.2,
-        ),
-    )
-
-    parsed = json.loads(response.text)
+    raw_text = call_gemini_json(client, prompt)
+    parsed = json.loads(raw_text)
     return [art for art in parsed.get("articles", []) if art.get("is_relevant")]
 
 
@@ -105,14 +119,23 @@ def make_article_id(link: str, title: str) -> str:
 
 def load_existing_data(path: str) -> dict:
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"last_updated": "", "items": []}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and isinstance(data.get("items"), list):
+                    return data
+        except Exception as e:
+            print(f"기존 JSON 읽기 경고(초기화 진행): {e}", file=sys.stderr)
+    return {"last_updated": "", "total_count": 0, "items": []}
 
 
 def main():
+    if not GEMINI_API_KEY:
+        print("오류: GEMINI_API_KEY 환경변수가 비어 있습니다. GitHub Secrets 등록 여부를 확인하세요.", file=sys.stderr)
+        sys.exit(1)
+
     existing = load_existing_data(OUTPUT_PATH)
-    existing_ids = {item["id"] for item in existing.get("items", [])}
+    existing_ids = {item["id"] for item in existing.get("items", []) if "id" in item}
     now_kst = datetime.now(KST)
     today_str = now_kst.strftime("%Y-%m-%d")
 
@@ -123,14 +146,21 @@ def main():
         candidates = []
 
         for q in cfg["queries"]:
-            for art in fetch_google_news_rss(q, limit=8):
+            try:
+                arts = fetch_google_news_rss(q, limit=8)
+                print(f"[{region}] '{q}' 검색 결과 {len(arts)}건")
+            except Exception as e:
+                print(f"[{region}] '{q}' RSS 수집 오류: {e}", file=sys.stderr)
+                continue
+
+            for art in arts:
                 art_id = make_article_id(art["link"], art["title"])
                 if art_id in existing_ids or art["title"] in seen_titles:
                     continue
                 seen_titles.add(art["title"])
                 candidates.append(art)
 
-        candidates = candidates[:15]
+        candidates = candidates[:12]
         if not candidates:
             continue
 
