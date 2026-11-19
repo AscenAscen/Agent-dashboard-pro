@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 KST = timezone(timedelta(hours=9))
-MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
 
 
 def get_gemini_key() -> str:
@@ -203,7 +203,7 @@ with tab1:
             st.error("Gemini API 키를 설정해 주세요.")
         else:
             queries = [q.strip() for q in queries_input.split(",") if q.strip()]
-            with st.spinner("핵심 뉴스를 검색하고 요약 중입니다 (약 5초 소요)..."):
+            with st.spinner("핵심 뉴스를 검색하고 요약 중입니다..."):
                 try:
                     raw_news = fetch_google_news(region_input, queries, limit_per_query=4)
                     if not raw_news:
