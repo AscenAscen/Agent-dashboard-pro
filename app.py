@@ -16,6 +16,7 @@ st.set_page_config(
 )
 
 KST = timezone(timedelta(hours=9))
+MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-2.5-flash"]
 
 
 def get_gemini_key() -> str:
@@ -83,7 +84,7 @@ def extract_json_block(text: str):
 def call_gemini_text(api_key: str, prompt: str, temperature: float = 0.2) -> str:
     client = genai.Client(api_key=api_key)
     last_err = ""
-    for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    for model_name in MODEL_CANDIDATES:
         try:
             res = client.models.generate_content(
                 model=model_name,
@@ -93,7 +94,7 @@ def call_gemini_text(api_key: str, prompt: str, temperature: float = 0.2) -> str
             if res and res.text:
                 return res.text
         except Exception as e:
-            last_err = f"{model_name}: {str(e)[:180]}"
+            last_err = f"{model_name}: {str(e)[:220]}"
     raise RuntimeError(last_err or "Gemini 호출 실패")
 
 
